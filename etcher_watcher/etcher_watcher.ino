@@ -28,13 +28,37 @@ int counter = 0;
 //Adafruit IO Definitions
 #define IO_USERNAME "fluorine21"
 #define IO_KEY "f7c7ec84639545c59312d8fdd3759489"
-#define IO_SERVER      "io.adafruit.com"
-#define IO_SERVERPORT  1883                   // use 8883 for SSL
+#define IO_SERVER "io.adafruit.com"
+#define IO_SERVERPORT  1883 // use 8883 for SSL
 WiFiClient client;
 Adafruit_MQTT_Client mqtt(&client, IO_SERVER, IO_SERVERPORT, IO_USERNAME, IO_KEY);
 Adafruit_MQTT_Publish dpt = Adafruit_MQTT_Publish(&mqtt, IO_USERNAME "/feeds/etcher-feed-group.diff-pump-temp");
+Adafruit_MQTT_Publish dpt_cw_in = Adafruit_MQTT_Publish(&mqtt, IO_USERNAME "/feeds/etcher-feed-group.diff-cw-in");
+Adafruit_MQTT_Publish dpt_cw_out = Adafruit_MQTT_Publish(&mqtt, IO_USERNAME "/feeds/etcher-feed-group.diff-cw-out");
+Adafruit_MQTT_Publish gun_cw_in = Adafruit_MQTT_Publish(&mqtt, IO_USERNAME "/feeds/etcher-feed-group.gun-cw-in");
+Adafruit_MQTT_Publish gun_cw_out = Adafruit_MQTT_Publish(&mqtt, IO_USERNAME "/feeds/etcher-feed-group.gun-cw-out");
+Adafruit_MQTT_Publish troom_mqtt = Adafruit_MQTT_Publish(&mqtt, IO_USERNAME "/feeds/etcher-feed-group.troom-mqtt");
+Adafruit_MQTT_Publish diff_status_mqtt = Adafruit_MQTT_Publish(&mqtt, IO_USERNAME "/feeds/etcher-feed-group.diff_status");
+Adafruit_MQTT_Publish ion_status_mqtt = Adafruit_MQTT_Publish(&mqtt, IO_USERNAME "/feeds/etcher-feed-group.ion_status");
 #define publish_interval 30000 //30 second publish interval
 unsigned long p_last;
+
+//Pushbutton definitions
+#define diff_reset_pin 22
+#define diff_release_pin 23
+int diff_reset;
+
+//Ion gauge controll definitions
+#define ion_on_pin = 1
+#define ion_off_pin = 2
+#define ion_fullscale_pin = 3
+#define ion_gauge_pin = 4
+#define ion_status_pin = 5
+#define ion_interval 10*60*60000 //every 10 hours
+#define ion_warm_time 30*60000 //30 min for gauge to warm up
+#define ion_state 0
+int ion_status;
+unsigned long ion_last;
 
 //LCD Definitions
 LiquidCrystal_PCF8574 lcd(0x27); // set the LCD address to 0x27 for a 16 chars and 2 line display
@@ -46,6 +70,9 @@ LiquidCrystal_PCF8574 lcd(0x27); // set the LCD address to 0x27 for a 16 chars a
 float tdiff, tdiff_in, tdiff_out, tgun_in, tgun_out, troom;
 int diff_status;
 #define tdiff_max 30
+
+#define readout_interval
+unsigned long readout_last;
 
 //Diff pump
 #define diff_thermo_clk 14
@@ -62,13 +89,22 @@ MAX6675 diff_thermo_out(diff_thermo_clk, diff_out_cs, diff_thermo_sd);
 //Gun water
 #define gun_in_cs 27
 MAX6675 gun_thermo_in(diff_thermo_clk, gun_in_cs, diff_thermo_sd);
-#define diff_out_cs 13
-//MAX6675 diff_thermo_out(diff_thermo_clk, diff_out_cs, diff_thermo_sd);
+#define gun_out_cs 18
+MAX6675 gun_thermo_out(diff_thermo_clk, gun_out_cs, diff_thermo_sd);
+
+//Gun water
+#define room_cs 19
+MAX6675 room_thermo(diff_thermo_clk, room_cs, diff_thermo_sd);
 
 //Function headers
 void MQTT_connect();
 void i2c_scan();
+void read_temps();
+void check_buttons();
 
+//IRSr
+void diff_reset_isr(){diff_status = 1; diff_reset = 1;}
+void diff_release_ist(){diff_reset = 0;}
 
 void setup() {
 
@@ -77,6 +113,12 @@ void setup() {
   troom = 0;
   tgun_out = 0;
   p_last = 0;
+  ion_status = 0;
+
+  pinMode(diff_reset_pin, INPUT);
+  pinMode(diff_release_pin, INPUT);
+  attachInterrupt(diff_reset_pin, diff_reset_isr, FALLING);
+  attachInterrupt(diff_release_pin, diff_release_isr, FALLING);
   
   Serial.begin(115200);
   delay(10);
@@ -93,7 +135,7 @@ void setup() {
   lcd.setBacklight(255);
   lcd.home();
   lcd.clear();
-  lcd.print("Booting..."); 
+  lcd.print("Booting"); 
   
   Serial.println();
   Serial.print("Connecting to network: ");
@@ -116,8 +158,15 @@ void setup() {
     Serial.print(".");
     counter++;
     if(counter>=60){ //after 30 seconds timeout - reset board
+      lcd.setCursor(0, 1);
+      lcd.print("fail");
       ESP.restart();
     }
+
+    if(counter%3==0)
+    {
+      lcd.print(".");  
+    } 
   }
   Serial.println("");
   Serial.println("WiFi connected");
@@ -126,12 +175,65 @@ void setup() {
   
 }
 
+void time_check(tref, interval)
+{
+  long long tnow = millis();
+  if(tnow - tref > interval || tnow-((long long)tref)<0)
+  {
+    return 1;
+  }
+  return 0;
+}
+
+void service_ion()
+{
+  if(ion_state == 0)//wait and warmup
+  {
+    if(time_check(ion_last, ion_interval)
+    {
+      ion_last = millis();
+      ion_state = 1;
+
+      //Turn on the gauge and wait 5 seconds
+      digitalWrite(ion_on_pin, HIGH);
+      delay(10);
+      digitalWrite(ion_on_pin, LOW);
+      delay(5000);
+
+      //Check if it's on
+      ion_status = digitalRead(ion_status_pin);
+        
+    }
+  }
+  if(ion_state == 1)//read
+  {
+    if(time_check(ion_last, ion_warm_time)
+    {
+      ion_last = millis();
+      ion_state = 0;  
+      
+      //Check if it's on
+      ion_status = digitalRead(ion_status_pin);
+
+      //Take a reading
+      
+      
+      
+    } 
+  }
+  else{ion_state = 0;}
+}
+
 void update_lcd()
 {
     lcd.home();
     lcd.clear();
     String ss = (diff_status ? "ON" : "OFF");
     lcd.print("Diff " + ss + " " + String(tdiff,1) + "C");
+    if(diff_reset)
+    {
+    
+    }
     lcd.setCursor(0, 1);
     lcd.print("CW IN "+ String(tdiff_in,1) + " OUT " + String(tdiff_out,1));
     lcd.setCursor(0, 2);
@@ -145,13 +247,48 @@ void publish_all()
 {
 
   //Connected to wifi here
-  MQTT_connect();
-  
+  MQTT_connect();  
   unsigned long tnow = millis();
-  if(tnow-p_last > publish_interval || tnow-p_last < 0)
+  if(time_check(p_last, publish_interval))
   {
+    p_last = tnow;
     if (! dpt.publish(tdiff)) {
-      Serial.println(F("publish failed"));
+      Serial.println(F("dpt publish failed"));
+    } else {
+      Serial.println(F("publish OK!"));
+    }
+    if (! dpt_cw_in.publish(tdiff_in)) {
+      Serial.println(F("dpt cw in publish failed"));
+    } else {
+      Serial.println(F("publish OK!"));
+    }
+    if (! dpt_cw_out.publish(tdiff_out)) {
+      Serial.println(F("dpt cw out publish failed"));
+    } else {
+      Serial.println(F("publish OK!"));
+    }
+    if (! gun_cw_in.publish(tgun_in)) {
+      Serial.println(F("gun cw in publish failed"));
+    } else {
+      Serial.println(F("publish OK!"));
+    }
+    if (! gun_cw_out.publish(tgun_out)) {
+      Serial.println(F("gun cw out publish failed"));
+    } else {
+      Serial.println(F("publish OK!"));
+    }
+    if (! troom_mqtt.publish(troom)) {
+      Serial.println(F("room publish failed"));
+    } else {
+      Serial.println(F("publish OK!"));
+    }
+    if (! diff_status_mqtt.publish(diff_status)) {
+      Serial.println(F("diff status publish failed"));
+    } else {
+      Serial.println(F("publish OK!"));
+    }
+    if (! ion_status_mqtt.publish(ion_status)) {
+      Serial.println(F("ion status publish failed"));
     } else {
       Serial.println(F("publish OK!"));
     }
@@ -163,6 +300,27 @@ void publish_all()
 }
 
 void loop() {
+
+  unsigned long tnow = millis();
+  if(time_check(readout_last, readout_interval))
+  {
+    readout_last = tnow;
+    check_wifi();
+
+    //Readout temperatures
+    read_temps();
+  
+    publish_all();
+  
+    update_lcd();
+  
+  }
+}
+
+
+
+void check_wifi()
+{
   if (WiFi.status() == WL_CONNECTED) { //if we are connected to Eduroam network
     counter = 0; //reset counter
     Serial.print("Wifi is still connected with IP: "); 
@@ -178,14 +336,18 @@ void loop() {
     ESP.restart();
     }
   }
+}
 
-
-
+void read_temps()
+{
   //Readout temperatures
   Serial.print("Diff pump C = "); 
   tdiff = diff_thermo.readCelsius();
   Serial.println(tdiff);
-  diff_status = (tdiff > tdiff_max ? 0 : 1);
+  if(tdiff > tdiff_max && diff_reset == 0)
+  {
+    diff_status = 0;  
+  }
 
   Serial.print("Diff pump water in C = "); 
   tdiff_in = diff_thermo_in.readCelsius();
@@ -199,12 +361,14 @@ void loop() {
   tgun_in = gun_thermo_in.readCelsius();
   Serial.println(tgun_in);
 
-  publish_all();
+  Serial.print("Gun water out C = "); 
+  tgun_out = gun_thermo_out.readCelsius();
+  Serial.println(tgun_out);
 
-  update_lcd();
-  
-  delay(5000);
-  
+  Serial.print("Room temp C = "); 
+  troom = room_thermo.readCelsius();
+  Serial.println(troom);
+
 }
 
 // Function to connect and reconnect as necessary to the MQTT server.
