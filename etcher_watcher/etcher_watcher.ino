@@ -38,8 +38,10 @@ Adafruit_MQTT_Publish dpt_cw_out = Adafruit_MQTT_Publish(&mqtt, IO_USERNAME "/fe
 Adafruit_MQTT_Publish gun_cw_in = Adafruit_MQTT_Publish(&mqtt, IO_USERNAME "/feeds/etcher-feed-group.gun-cw-in");
 Adafruit_MQTT_Publish gun_cw_out = Adafruit_MQTT_Publish(&mqtt, IO_USERNAME "/feeds/etcher-feed-group.gun-cw-out");
 Adafruit_MQTT_Publish troom_mqtt = Adafruit_MQTT_Publish(&mqtt, IO_USERNAME "/feeds/etcher-feed-group.troom-mqtt");
-Adafruit_MQTT_Publish diff_status_mqtt = Adafruit_MQTT_Publish(&mqtt, IO_USERNAME "/feeds/etcher-feed-group.diff_status");
-Adafruit_MQTT_Publish ion_status_mqtt = Adafruit_MQTT_Publish(&mqtt, IO_USERNAME "/feeds/etcher-feed-group.ion_status");
+Adafruit_MQTT_Publish diff_status_mqtt = Adafruit_MQTT_Publish(&mqtt, IO_USERNAME "/feeds/etcher-feed-group.diff-status");
+Adafruit_MQTT_Publish ion_status_mqtt = Adafruit_MQTT_Publish(&mqtt, IO_USERNAME "/feeds/etcher-feed-group.ion-status");
+Adafruit_MQTT_Publish ion_fullscale_mqtt = Adafruit_MQTT_Publish(&mqtt, IO_USERNAME "/feeds/etcher-feed-group.ion-fullscale");
+Adafruit_MQTT_Publish ion_gauge_mqtt = Adafruit_MQTT_Publish(&mqtt, IO_USERNAME "/feeds/etcher-feed-group.ion-gauge");
 #define publish_interval 30000 //30 second publish interval
 unsigned long p_last;
 
@@ -49,21 +51,23 @@ unsigned long p_last;
 int diff_reset;
 
 //Ion gauge controll definitions
-#define ion_on_pin = 1
-#define ion_off_pin = 2
-#define ion_fullscale_pin = 3
-#define ion_gauge_pin = 4
-#define ion_status_pin = 5
+#define ion_on_pin 1
+#define ion_off_pin 2
+#define ion_fullscale_pin 36
+#define ion_gauge_pin 39
+#define ion_status_pin 5
 #define ion_interval 10*60*60000 //every 10 hours
 #define ion_warm_time 30*60000 //30 min for gauge to warm up
-#define ion_state 0
 int ion_status;
+int ion_state;
 unsigned long ion_last;
+float ion_fullscale, ion_gauge;//Holds the readings from the ion gauge
+int ar;
 
 //LCD Definitions
 LiquidCrystal_PCF8574 lcd(0x27); // set the LCD address to 0x27 for a 16 chars and 2 line display
 #define I2C_SDA 25
-#define I2C_SCL 33
+#define I2C_SCL 26
 
 
 //Thermocouple definitions
@@ -71,13 +75,13 @@ float tdiff, tdiff_in, tdiff_out, tgun_in, tgun_out, troom;
 int diff_status;
 #define tdiff_max 30
 
-#define readout_interval
+#define readout_interval 10000 //10 seconds for each readout
 unsigned long readout_last;
 
 //Diff pump
 #define diff_thermo_clk 14
 #define diff_thermo_cs 12
-#define diff_thermo_sd 35
+#define diff_thermo_sd 33
 MAX6675 diff_thermo(diff_thermo_clk, diff_thermo_cs, diff_thermo_sd);
 
 //Diff water
@@ -101,22 +105,34 @@ void MQTT_connect();
 void i2c_scan();
 void read_temps();
 void check_buttons();
+int time_check(unsigned long tref, unsigned long interval);
+void check_wifi();
+char * sci(double number, int digits);
+
 
 //IRSr
-void diff_reset_isr(){diff_status = 1; diff_reset = 1;}
-void diff_release_ist(){diff_reset = 0;}
+int d_rst, d_rl;
+void diff_reset_isr(){diff_status = 1; diff_reset = 1;d_rst = 1;}
+void diff_release_isr(){diff_reset = 0;d_rl = 1;}
 
 void setup() {
 
   //Variable initialization
-  diff_status = 0;
+  diff_status = 1;
   troom = 0;
   tgun_out = 0;
   p_last = 0;
   ion_status = 0;
+  ion_state = 0;
 
-  pinMode(diff_reset_pin, INPUT);
-  pinMode(diff_release_pin, INPUT);
+  //Timers
+  readout_last = 0;
+  p_last = 0;
+  ion_last = 0;
+
+  //Pushbutton and interrupt configuration
+  pinMode(diff_reset_pin, INPUT_PULLUP);
+  pinMode(diff_release_pin, INPUT_PULLUP);
   attachInterrupt(diff_reset_pin, diff_reset_isr, FALLING);
   attachInterrupt(diff_release_pin, diff_release_isr, FALLING);
   
@@ -158,12 +174,12 @@ void setup() {
     Serial.print(".");
     counter++;
     if(counter>=60){ //after 30 seconds timeout - reset board
-      lcd.setCursor(0, 1);
+      lcd.setCursor(3, 1);
       lcd.print("fail");
       ESP.restart();
     }
 
-    if(counter%3==0)
+    if(counter%5==0)
     {
       lcd.print(".");  
     } 
@@ -175,7 +191,37 @@ void setup() {
   
 }
 
-void time_check(tref, interval)
+void ion_read()
+{
+  //Do the fullscale read first
+  int ion_vals = 0;
+  for(int i = 0; i < 10; i++)
+  {
+    ion_vals += analogRead(ion_fullscale_pin);
+    delay(10);  
+  }
+  ion_vals = ion_vals / 10;
+
+  ion_fullscale = ion_vals * ((float)(3.3/4095));
+  ion_fullscale = ion_fullscale * (5/3.3);
+  ion_fullscale = (1e-3) * pow(10, -1*ion_fullscale);
+
+  //Then do the gauge read
+  ion_vals = 0;
+  for(int i = 0; i < 10; i++)
+  {
+    ion_vals += analogRead(ion_gauge_pin);
+    delay(10);  
+  }
+  ion_vals = ion_vals / 10;
+  ion_gauge = ion_vals * ((float)(3.3/4095));
+  ion_gauge = ion_gauge * (10/2.4);
+
+  Serial.println("Ion fullscale was " + String(sci(ion_fullscale,2)) + ", gauge was " + String(sci(ion_gauge,2)));
+
+}
+
+int time_check(unsigned long tref, unsigned long interval)
 {
   long long tnow = millis();
   if(tnow - tref > interval || tnow-((long long)tref)<0)
@@ -189,7 +235,7 @@ void service_ion()
 {
   if(ion_state == 0)//wait and warmup
   {
-    if(time_check(ion_last, ion_interval)
+    if(time_check(ion_last, ion_interval))
     {
       ion_last = millis();
       ion_state = 1;
@@ -205,9 +251,9 @@ void service_ion()
         
     }
   }
-  if(ion_state == 1)//read
+  else if(ion_state == 1)//read
   {
-    if(time_check(ion_last, ion_warm_time)
+    if(time_check(ion_last, ion_warm_time))
     {
       ion_last = millis();
       ion_state = 0;  
@@ -216,8 +262,12 @@ void service_ion()
       ion_status = digitalRead(ion_status_pin);
 
       //Take a reading
-      
-      
+      ion_read();
+
+      //Shut the gauge off
+      digitalWrite(ion_off_pin, HIGH);
+      delay(10);
+      digitalWrite(ion_off_pin, LOW);
       
     } 
   }
@@ -232,7 +282,7 @@ void update_lcd()
     lcd.print("Diff " + ss + " " + String(tdiff,1) + "C");
     if(diff_reset)
     {
-    
+      lcd.print(" RESET");
     }
     lcd.setCursor(0, 1);
     lcd.print("CW IN "+ String(tdiff_in,1) + " OUT " + String(tdiff_out,1));
@@ -292,6 +342,16 @@ void publish_all()
     } else {
       Serial.println(F("publish OK!"));
     }
+    if (! ion_fullscale_mqtt.publish(ion_fullscale)) {
+      Serial.println(F("ion fullscale publish failed"));
+    } else {
+      Serial.println(F("publish OK!"));
+    }
+    if (! ion_gauge_mqtt.publish(ion_gauge)) {
+      Serial.println(F("ion gauge publish failed"));
+    } else {
+      Serial.println(F("publish OK!"));
+    }
   
     if(! mqtt.ping()) {
       mqtt.disconnect();
@@ -300,6 +360,20 @@ void publish_all()
 }
 
 void loop() {
+
+  if(d_rst)
+  {
+    lcd.home();lcd.clear();lcd.print("DIFF RESET");  
+    d_rst = 0;
+    delay(2000);
+  }
+  if(d_rl)
+  {
+    lcd.home();lcd.clear();lcd.print("DIFF RELEASE");
+    d_rl = 0;
+    delay(2000);  
+  }
+
 
   unsigned long tnow = millis();
   if(time_check(readout_last, readout_interval))
@@ -369,6 +443,12 @@ void read_temps()
   troom = room_thermo.readCelsius();
   Serial.println(troom);
 
+  ar = analogRead(36);
+  Serial.println("VP was " + String(ar));
+  ar = analogRead(39);
+  Serial.println("VN was " + String(ar));
+  
+
 }
 
 // Function to connect and reconnect as necessary to the MQTT server.
@@ -432,4 +512,111 @@ byte error, address;
   }
   delay(5000);          
 
+}
+
+
+char __mathHelperBuffer[17];
+
+
+//////////////////////////////////////////////////
+//
+// FLOAT REPRESENTATION HELPERS
+//
+char * sci(double number, int digits)
+{
+  int exponent = 0;
+  int pos = 0;
+
+  // Handling these costs 13 bytes RAM
+  // shorten them with N, I, -I ?
+  if (isnan(number)) 
+  {
+    strcpy(__mathHelperBuffer, "nan");
+    return __mathHelperBuffer;
+  }
+  if (isinf(number))
+  {
+    if (number < 0) strcpy(__mathHelperBuffer, "-inf");
+    strcpy(__mathHelperBuffer, "inf");
+    return __mathHelperBuffer;
+  }
+
+  // Handle negative numbers
+  bool neg = (number < 0.0);
+  if (neg)
+  {
+    __mathHelperBuffer[pos++] = '-';
+    number = -number;
+  }
+
+  while (number >= 10.0)
+  {
+    number /= 10;
+    exponent++;
+  }
+  while (number < 1 && number != 0.0)
+  {
+    number *= 10;
+    exponent--;
+  }
+
+  // Round correctly so that print(1.999, 2) prints as "2.00"
+  double rounding = 0.5;
+  for (uint8_t i = 0; i < digits; ++i)
+  {
+    rounding *= 0.1;
+  }
+  number += rounding;
+  if (number >= 10)
+  {
+    exponent++;
+    number /= 10;
+  }
+
+
+  // Extract the integer part of the number and print it
+  uint8_t d = (uint8_t)number;
+  double remainder = number - d;
+  __mathHelperBuffer[pos++] = d + '0';   // 1 digit before decimal point
+  if (digits > 0)
+  {
+    __mathHelperBuffer[pos++] = '.';  // decimal point TODO:rvdt CONFIG?
+  }
+
+
+  // Extract digits from the remainder one at a time to prevent missing leading zero's
+  while (digits-- > 0)
+  {
+    remainder *= 10.0;
+    d = (uint8_t)remainder;
+    __mathHelperBuffer[pos++] = d + '0';
+    remainder -= d;
+  }
+
+
+  // print exponent
+  __mathHelperBuffer[pos++] = 'E';
+  neg = exponent < 0;
+  if (neg)
+  {
+    __mathHelperBuffer[pos++] = '-';
+    exponent = -exponent;
+  }
+  else __mathHelperBuffer[pos++] = '+';
+
+
+  // 3 digits for exponent;           // needed for double
+  // d = exponent / 100;
+  // __mathHelperBuffer[pos++] = d + '0';
+  // exponent -= d * 100;
+
+  // 2 digits for exponent
+  d = exponent / 10;
+  __mathHelperBuffer[pos++] = d + '0';
+  d = exponent - d*10;
+  __mathHelperBuffer[pos++] = d + '0';
+
+  __mathHelperBuffer[pos] = '\0';
+
+  return __mathHelperBuffer;
 }
