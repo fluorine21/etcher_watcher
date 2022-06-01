@@ -51,7 +51,7 @@ unsigned long p_last;
 int diff_reset;
 
 //Ion gauge controll definitions
-#define ion_on_pin 1
+#define ion_on_pin 15
 #define ion_off_pin 2
 #define ion_fullscale_pin 36
 #define ion_gauge_pin 39
@@ -204,7 +204,7 @@ void ion_read()
 
   ion_fullscale = ion_vals * ((float)(3.3/4095));
   ion_fullscale = ion_fullscale * (5/3.3);
-  ion_fullscale = (1e-3) * pow(10, -1*ion_fullscale);
+  //ion_fullscale = (1e-3) * pow(10, -1*ion_fullscale);
 
   //Then do the gauge read
   ion_vals = 0;
@@ -237,6 +237,7 @@ void service_ion()
   {
     if(time_check(ion_last, ion_interval))
     {
+      Serial.println("Ion gauge on");
       ion_last = millis();
       ion_state = 1;
 
@@ -255,6 +256,7 @@ void service_ion()
   {
     if(time_check(ion_last, ion_warm_time))
     {
+      Serial.println("Ion gauge off");
       ion_last = millis();
       ion_state = 0;  
       
@@ -374,6 +376,7 @@ void loop() {
     delay(2000);  
   }
 
+  service_ion();
 
   unsigned long tnow = millis();
   if(time_check(readout_last, readout_interval))
