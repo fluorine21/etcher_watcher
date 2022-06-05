@@ -7,6 +7,14 @@
 #include "LiquidCrystal_PCF8574.h"
 
 
+#include <WiFiClient.h>
+#include <WebServer.h>
+#include <ESPmDNS.h>
+#include <Update.h>
+WebServer server(80);
+String lip;
+
+
 #define EAP_IDENTITY "jawillia" //if connecting from another corporation, use identity@organisation.domain in Eduroam 
 #define EAP_USERNAME "jawillia" //oftentimes just a repeat of the identity
 #define EAP_PASSWORD "T22[$Q,qGFG}" //your Eduroam password
@@ -62,6 +70,7 @@ int ion_status;
 int ion_state;
 unsigned long ion_last;
 float ion_fullscale, ion_gauge;//Holds the readings from the ion gauge
+int ion_new;
 int ar;
 
 //LCD Definitions
@@ -73,30 +82,31 @@ LiquidCrystal_PCF8574 lcd(0x27); // set the LCD address to 0x27 for a 16 chars a
 //Thermocouple definitions
 float tdiff, tdiff_in, tdiff_out, tgun_in, tgun_out, troom;
 int diff_status;
-#define tdiff_max 30
+#define diff_status_pin 4
+#define tdiff_max 140////////Diff setpoint
 
 #define readout_interval 10000 //10 seconds for each readout
 unsigned long readout_last;
 
 //Diff pump
 #define diff_thermo_clk 14
-#define diff_thermo_cs 12
+#define diff_thermo_cs 12 
 #define diff_thermo_sd 33
 MAX6675 diff_thermo(diff_thermo_clk, diff_thermo_cs, diff_thermo_sd);
 
 //Diff water
-#define diff_in_cs 32
+#define diff_in_cs 27
 MAX6675 diff_thermo_in(diff_thermo_clk, diff_in_cs, diff_thermo_sd);
 #define diff_out_cs 13
 MAX6675 diff_thermo_out(diff_thermo_clk, diff_out_cs, diff_thermo_sd);
 
 //Gun water
-#define gun_in_cs 27
+#define gun_in_cs 32
 MAX6675 gun_thermo_in(diff_thermo_clk, gun_in_cs, diff_thermo_sd);
 #define gun_out_cs 18
 MAX6675 gun_thermo_out(diff_thermo_clk, gun_out_cs, diff_thermo_sd);
 
-//Gun water
+//Room
 #define room_cs 19
 MAX6675 room_thermo(diff_thermo_clk, room_cs, diff_thermo_sd);
 
@@ -108,6 +118,7 @@ void check_buttons();
 int time_check(unsigned long tref, unsigned long interval);
 void check_wifi();
 char * sci(double number, int digits);
+void setup_webserver();
 
 
 //IRSr
@@ -130,6 +141,8 @@ void setup() {
   p_last = 0;
   ion_last = 0;
 
+  pinMode(diff_status_pin, OUTPUT);
+
   //Pushbutton and interrupt configuration
   pinMode(diff_reset_pin, INPUT_PULLUP);
   pinMode(diff_release_pin, INPUT_PULLUP);
@@ -138,10 +151,10 @@ void setup() {
   
   Serial.begin(115200);
   delay(10);
-  Serial.println("Boot delay of 5 seconds");
+  //Serial.println("Boot delay of 5 seconds");
   for(int i = 0; i < 5; i++)
   {
-    delay(1000);
+    //delay(1000);
     Serial.print(".");  
   }
 
@@ -174,12 +187,12 @@ void setup() {
     Serial.print(".");
     counter++;
     if(counter>=60){ //after 30 seconds timeout - reset board
-      lcd.setCursor(3, 1);
+      lcd.setCursor(4, 1);
       lcd.print("fail");
       ESP.restart();
     }
 
-    if(counter%5==0)
+    if(counter%4==0)
     {
       lcd.print(".");  
     } 
@@ -187,7 +200,12 @@ void setup() {
   Serial.println("");
   Serial.println("WiFi connected");
   Serial.println("IP address set: "); 
-  Serial.println(WiFi.localIP()); //print LAN IP
+  lip = WiFi.localIP().toString();
+  Serial.println(lip); //print LAN IP
+  lcd.setCursor(3, 1);
+  lcd.print(lip);
+
+  setup_webserver();
   
 }
 
@@ -204,7 +222,7 @@ void ion_read()
 
   ion_fullscale = ion_vals * ((float)(3.3/4095));
   ion_fullscale = ion_fullscale * (5/3.3);
-  //ion_fullscale = (1e-3) * pow(10, -1*ion_fullscale);
+  ion_fullscale = (1e-3) * pow(10, -1*ion_fullscale);
 
   //Then do the gauge read
   ion_vals = 0;
@@ -218,6 +236,7 @@ void ion_read()
   ion_gauge = ion_gauge * (10/2.4);
 
   Serial.println("Ion fullscale was " + String(sci(ion_fullscale,2)) + ", gauge was " + String(sci(ion_gauge,2)));
+  ion_new = 1;
 
 }
 
@@ -291,8 +310,15 @@ void update_lcd()
     lcd.setCursor(0, 2);
     lcd.print("Gun IN "+String(tgun_in,1)+" OUT " +String(tgun_out,1));
     lcd.setCursor(0, 3);
-    String ws = (WiFi.status() == WL_CONNECTED ? "UP" : "DOWN");
-    lcd.print("Room "+String(troom,1) + " WiFi " + ws);
+    lcd.print("Rm "+String(troom,1) + " ");
+    if(WiFi.status() == WL_CONNECTED)
+    {
+      lcd.print(lip);  
+    }
+    else
+    {
+      lcd.print("DOWN");  
+    }
 }
 
 void publish_all()
@@ -344,15 +370,21 @@ void publish_all()
     } else {
       Serial.println(F("publish OK!"));
     }
-    if (! ion_fullscale_mqtt.publish(ion_fullscale)) {
+
+    char str_buff[10];
+    String(ion_fullscale).toCharArray(str_buff, 10);
+    if (ion_new && ion_fullscale_mqtt.publish(str_buff)) {
+      Serial.println(F("publish OK!"));
+      
+    } else {
       Serial.println(F("ion fullscale publish failed"));
-    } else {
-      Serial.println(F("publish OK!"));
     }
-    if (! ion_gauge_mqtt.publish(ion_gauge)) {
-      Serial.println(F("ion gauge publish failed"));
-    } else {
+    String(ion_gauge).toCharArray(str_buff, 10);
+    if (ion_new && ion_gauge_mqtt.publish(str_buff)) {
       Serial.println(F("publish OK!"));
+      ion_new = 0;
+    } else {
+      Serial.println(F("ion gauge publish failed"));
     }
   
     if(! mqtt.ping()) {
@@ -362,6 +394,13 @@ void publish_all()
 }
 
 void loop() {
+
+  //WiFiClient c = server.client();
+  //while(c){
+    server.handleClient();
+  //}
+
+  digitalWrite(diff_status_pin, diff_status);
 
   if(d_rst)
   {
@@ -390,7 +429,9 @@ void loop() {
     publish_all();
   
     update_lcd();
-  
+
+    //Report the gauge reading for debugging porpoises
+    Serial.println("Ion fullscale was " + String(sci(ion_fullscale,2)) + ", gauge was " + String(sci(ion_gauge,2)));
   }
 }
 
@@ -415,11 +456,23 @@ void check_wifi()
   }
 }
 
+float read_temp(MAX6675 * tc)
+{
+  int num_avgs = 10;
+  float t_sum = 0;
+  for(int i = 0; i < num_avgs; i++)
+  {
+      t_sum += tc->readCelsius();
+      delay(1);
+  }  
+  return t_sum/num_avgs; 
+}
+
 void read_temps()
 {
   //Readout temperatures
   Serial.print("Diff pump C = "); 
-  tdiff = diff_thermo.readCelsius();
+  tdiff = read_temp(&diff_thermo);
   Serial.println(tdiff);
   if(tdiff > tdiff_max && diff_reset == 0)
   {
@@ -427,23 +480,23 @@ void read_temps()
   }
 
   Serial.print("Diff pump water in C = "); 
-  tdiff_in = diff_thermo_in.readCelsius();
+  tdiff_in = read_temp(&diff_thermo_in);
   Serial.println(tdiff_in);
   
   Serial.print("Diff pump water out C = "); 
-  tdiff_out = diff_thermo_out.readCelsius();
+  tdiff_out = read_temp(&diff_thermo_out);
   Serial.println(tdiff_out);
 
   Serial.print("Gun water in C = "); 
-  tgun_in = gun_thermo_in.readCelsius();
+  tgun_in = read_temp(&gun_thermo_in);
   Serial.println(tgun_in);
 
   Serial.print("Gun water out C = "); 
-  tgun_out = gun_thermo_out.readCelsius();
+  tgun_out = read_temp(&gun_thermo_out);
   Serial.println(tgun_out);
 
   Serial.print("Room temp C = "); 
-  troom = room_thermo.readCelsius();
+  troom = read_temp(&room_thermo);
   Serial.println(troom);
 
   ar = analogRead(36);
@@ -622,4 +675,155 @@ char * sci(double number, int digits)
   __mathHelperBuffer[pos] = '\0';
 
   return __mathHelperBuffer;
+}
+
+
+
+
+
+
+
+
+
+
+////////////////////
+//Web Server Stuff//
+////////////////////
+
+
+/*
+ * Login page
+ */
+
+const char* loginIndex =
+ "<form name='loginForm'>"
+    "<table width='20%' bgcolor='A09F9F' align='center'>"
+        "<tr>"
+            "<td colspan=2>"
+                "<center><font size=4><b>ESP32 Login Page</b></font></center>"
+                "<br>"
+            "</td>"
+            "<br>"
+            "<br>"
+        "</tr>"
+        "<tr>"
+             "<td>Username:</td>"
+             "<td><input type='text' size=25 name='userid'><br></td>"
+        "</tr>"
+        "<br>"
+        "<br>"
+        "<tr>"
+            "<td>Password:</td>"
+            "<td><input type='Password' size=25 name='pwd'><br></td>"
+            "<br>"
+            "<br>"
+        "</tr>"
+        "<tr>"
+            "<td><input type='submit' onclick='check(this.form)' value='Login'></td>"
+        "</tr>"
+    "</table>"
+"</form>"
+"<script>"
+    "function check(form)"
+    "{"
+    "if(form.userid.value=='fluorine21' && form.pwd.value=='3666569986')"
+    "{"
+    "window.open('/serverIndex')"
+    "}"
+    "else"
+    "{"
+    " alert('Error Password or Username')/*displays error message*/"
+    "}"
+    "}"
+"</script>";
+
+/*
+ * Server Index Page
+ */
+
+const char* serverIndex =
+"<script src='https://ajax.googleapis.com/ajax/libs/jquery/3.2.1/jquery.min.js'></script>"
+"<form method='POST' action='#' enctype='multipart/form-data' id='upload_form'>"
+   "<input type='file' name='update'>"
+        "<input type='submit' value='Update'>"
+    "</form>"
+ "<div id='prg'>progress: 0%</div>"
+ "<script>"
+  "$('form').submit(function(e){"
+  "e.preventDefault();"
+  "var form = $('#upload_form')[0];"
+  "var data = new FormData(form);"
+  " $.ajax({"
+  "url: '/update',"
+  "type: 'POST',"
+  "data: data,"
+  "contentType: false,"
+  "processData:false,"
+  "xhr: function() {"
+  "var xhr = new window.XMLHttpRequest();"
+  "xhr.upload.addEventListener('progress', function(evt) {"
+  "if (evt.lengthComputable) {"
+  "var per = evt.loaded / evt.total;"
+  "$('#prg').html('progress: ' + Math.round(per*100) + '%');"
+  "}"
+  "}, false);"
+  "return xhr;"
+  "},"
+  "success:function(d, s) {"
+  "console.log('success!')"
+ "},"
+ "error: function (a, b, c) {"
+ "}"
+ "});"
+ "});"
+ "</script>";
+
+/*
+ * setup function
+ */
+void setup_webserver(){
+
+  /*use mdns for host name resolution*/
+  if (!MDNS.begin(host)) { //http://esp32.local
+    Serial.println("Error setting up MDNS responder!");
+    while (1) {
+      delay(1000);
+    }
+  }
+  Serial.println("mDNS responder started");
+  /*return index page which is stored in serverIndex */
+  server.on("/", HTTP_GET, []() {
+    server.sendHeader("Connection", "close");
+    server.send(200, "text/html", loginIndex);
+  });
+  server.on("/serverIndex", HTTP_GET, []() {
+    server.sendHeader("Connection", "close");
+    server.send(200, "text/html", serverIndex);
+  });
+  /*handling uploading firmware file */
+  server.on("/update", HTTP_POST, []() {
+    server.sendHeader("Connection", "close");
+    server.send(200, "text/plain", (Update.hasError()) ? "FAIL" : "OK");
+    ESP.restart();
+  }, []() {
+    HTTPUpload& upload = server.upload();
+    if (upload.status == UPLOAD_FILE_START) {
+      Serial.printf("Update: %s\n", upload.filename.c_str());
+      if (!Update.begin(UPDATE_SIZE_UNKNOWN)) { //start with max available size
+        Update.printError(Serial);
+      }
+    } else if (upload.status == UPLOAD_FILE_WRITE) {
+      /* flashing firmware to ESP*/
+      if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
+        Update.printError(Serial);
+      }
+    } else if (upload.status == UPLOAD_FILE_END) {
+      if (Update.end(true)) { //true to set the size to the current progress
+        Serial.printf("Update Success: %u\nRebooting...\n", upload.totalSize);
+      } else {
+        Update.printError(Serial);
+      }
+    }
+  });
+  server.begin();
 }
