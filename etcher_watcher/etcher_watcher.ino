@@ -7,12 +7,23 @@
 #include "LiquidCrystal_PCF8574.h"
 
 
+
+#include <stdio.h>
+#include <string.h>
+#include <WiFiMulti.h>
+#include <HTTPClient.h>
+#include <HTTPUpdate.h>
+#include <ArduinoOTA.h>
+#include <EEPROM.h>
+
 #include <WiFiClient.h>
-#include <WebServer.h>
-#include <ESPmDNS.h>
-#include <Update.h>
-WebServer server(80);
-String lip;
+
+
+
+String lip; //local ip
+
+#define OTA_UPDATE_INTERVAL (2*60*1000)//2min
+unsigned long ota_update_timer;
 
 
 #define EAP_IDENTITY "jawillia" //if connecting from another corporation, use identity@organisation.domain in Eduroam 
@@ -119,7 +130,7 @@ int time_check(unsigned long tref, unsigned long interval);
 void check_wifi();
 char * sci(double number, int digits);
 void setup_webserver();
-
+void OTA_Update();
 
 //IRSr
 int d_rst, d_rl;
@@ -205,8 +216,6 @@ void setup() {
   lcd.setCursor(3, 1);
   lcd.print(lip);
 
-  setup_webserver();
-  
 }
 
 void ion_read()
@@ -220,9 +229,9 @@ void ion_read()
   }
   ion_vals = ion_vals / 10;
 
-  ion_fullscale = ion_vals * ((float)(3.3/4095));
+  ion_fullscale = float(ion_vals) * ((float)(3.3/4095));
   ion_fullscale = ion_fullscale * (5/3.3);
-  ion_fullscale = (1e-3) * pow(10, -1*ion_fullscale);
+  //ion_fullscale = (1e-3) * pow(10, -1*ion_fullscale);
 
   //Then do the gauge read
   ion_vals = 0;
@@ -232,8 +241,8 @@ void ion_read()
     delay(10);  
   }
   ion_vals = ion_vals / 10;
-  ion_gauge = ion_vals * ((float)(3.3/4095));
-  ion_gauge = ion_gauge * (10/2.4);
+  ion_gauge = float(ion_vals) * ((float)(3.3/4095));
+  //ion_gauge = ion_gauge * (10/2.4);
 
   Serial.println("Ion fullscale was " + String(sci(ion_fullscale,2)) + ", gauge was " + String(sci(ion_gauge,2)));
   ion_new = 1;
@@ -371,16 +380,13 @@ void publish_all()
       Serial.println(F("publish OK!"));
     }
 
-    char str_buff[10];
-    String(ion_fullscale).toCharArray(str_buff, 10);
-    if (ion_new && ion_fullscale_mqtt.publish(str_buff)) {
+    if (ion_new && ion_fullscale_mqtt.publish(ion_fullscale)) {
       Serial.println(F("publish OK!"));
       
     } else {
       Serial.println(F("ion fullscale publish failed"));
     }
-    String(ion_gauge).toCharArray(str_buff, 10);
-    if (ion_new && ion_gauge_mqtt.publish(str_buff)) {
+    if (ion_new && ion_gauge_mqtt.publish(ion_gauge)) {
       Serial.println(F("publish OK!"));
       ion_new = 0;
     } else {
@@ -394,11 +400,6 @@ void publish_all()
 }
 
 void loop() {
-
-  //WiFiClient c = server.client();
-  //while(c){
-    server.handleClient();
-  //}
 
   digitalWrite(diff_status_pin, diff_status);
 
@@ -432,6 +433,8 @@ void loop() {
 
     //Report the gauge reading for debugging porpoises
     Serial.println("Ion fullscale was " + String(sci(ion_fullscale,2)) + ", gauge was " + String(sci(ion_gauge,2)));
+
+    OTA_Update();
   }
 }
 
@@ -686,144 +689,105 @@ char * sci(double number, int digits)
 
 
 
-////////////////////
-//Web Server Stuff//
-////////////////////
 
 
-/*
- * Login page
- */
 
-const char* loginIndex =
- "<form name='loginForm'>"
-    "<table width='20%' bgcolor='A09F9F' align='center'>"
-        "<tr>"
-            "<td colspan=2>"
-                "<center><font size=4><b>ESP32 Login Page</b></font></center>"
-                "<br>"
-            "</td>"
-            "<br>"
-            "<br>"
-        "</tr>"
-        "<tr>"
-             "<td>Username:</td>"
-             "<td><input type='text' size=25 name='userid'><br></td>"
-        "</tr>"
-        "<br>"
-        "<br>"
-        "<tr>"
-            "<td>Password:</td>"
-            "<td><input type='Password' size=25 name='pwd'><br></td>"
-            "<br>"
-            "<br>"
-        "</tr>"
-        "<tr>"
-            "<td><input type='submit' onclick='check(this.form)' value='Login'></td>"
-        "</tr>"
-    "</table>"
-"</form>"
-"<script>"
-    "function check(form)"
-    "{"
-    "if(form.userid.value=='fluorine21' && form.pwd.value=='3666569986')"
-    "{"
-    "window.open('/serverIndex')"
-    "}"
-    "else"
-    "{"
-    " alert('Error Password or Username')/*displays error message*/"
-    "}"
-    "}"
-"</script>";
 
-/*
- * Server Index Page
- */
+long cv = 0 ;
 
-const char* serverIndex =
-"<script src='https://ajax.googleapis.com/ajax/libs/jquery/3.2.1/jquery.min.js'></script>"
-"<form method='POST' action='#' enctype='multipart/form-data' id='upload_form'>"
-   "<input type='file' name='update'>"
-        "<input type='submit' value='Update'>"
-    "</form>"
- "<div id='prg'>progress: 0%</div>"
- "<script>"
-  "$('form').submit(function(e){"
-  "e.preventDefault();"
-  "var form = $('#upload_form')[0];"
-  "var data = new FormData(form);"
-  " $.ajax({"
-  "url: '/update',"
-  "type: 'POST',"
-  "data: data,"
-  "contentType: false,"
-  "processData:false,"
-  "xhr: function() {"
-  "var xhr = new window.XMLHttpRequest();"
-  "xhr.upload.addEventListener('progress', function(evt) {"
-  "if (evt.lengthComputable) {"
-  "var per = evt.loaded / evt.total;"
-  "$('#prg').html('progress: ' + Math.round(per*100) + '%');"
-  "}"
-  "}, false);"
-  "return xhr;"
-  "},"
-  "success:function(d, s) {"
-  "console.log('success!')"
- "},"
- "error: function (a, b, c) {"
- "}"
- "});"
- "});"
- "</script>";
+#define WIFI_CONNECT_SSID ""        // To edit for your own code.
+#define WIFI_CONNECT_PSWD ""        // To edit for your own code.
+#define WIFI_CONNECT_WAIT_TIME  500
+#define WIFI_CONNECT_WAIT_LIMIT 20
+WiFiMulti wm ;
 
-/*
- * setup function
- */
-void setup_webserver(){
+String otaDirURL      = "https://github.com/fluorine21/etcher_watcher/blob/main/etcher_watcher/" ; // To edit for your own code.
+String otaCheckURL    = otaDirURL + "otaCheck.php" ;
+String otaBinFilename = "etcher_watcher.ino.esp32.bin" ;                 // To edit for your own code.
+String otaBinURL      = otaDirURL + otaBinFilename ;
 
-  /*use mdns for host name resolution*/
-  if (!MDNS.begin(host)) { //http://esp32.local
-    Serial.println("Error setting up MDNS responder!");
-    while (1) {
-      delay(1000);
+#define EEPROM_ID_STR      "OTA_BASIC"
+#define EEPROM_ID_STR_SIZE 10
+#define EEPROM_SIZE        (EEPROM_ID_STR_SIZE + sizeof(cv))
+
+void ReSet()
+{  
+  ESP.restart() ;  
+}
+
+
+void EEPROM_WriteData(void)
+{
+  int i ;
+  byte data[EEPROM_SIZE] ;
+
+  memcpy(data, EEPROM_ID_STR, EEPROM_ID_STR_SIZE) ;
+  memcpy(data + EEPROM_ID_STR_SIZE, &cv, sizeof(cv)) ;
+  for (i = 0; i < EEPROM_SIZE; i++) EEPROM.write(i, data[i]) ;
+  EEPROM.commit() ;
+}
+
+void EEPROM_ReadData(void)
+{
+  int i ;
+  byte data[EEPROM_SIZE] ;
+
+  for (i = 0; i < EEPROM_SIZE; i++) data[i] = (byte)EEPROM.read(i) ;
+  if (memcmp(data, EEPROM_ID_STR, EEPROM_ID_STR_SIZE - 1) == 0) {
+    memcpy(&cv, data + EEPROM_ID_STR_SIZE, sizeof(cv)) ;
+  }
+}
+
+void OTA_Update()
+{
+  //timer return
+  if(!time_check(ota_update_timer, OTA_UPDATE_INTERVAL))
+  {
+    return;
+  }
+  ota_update_timer = millis();
+  
+  int hrc ;
+  t_httpUpdate_return hur ;
+  long nv ;
+  HTTPClient http ;
+  WiFiClient otaClient ;
+
+  http.begin(otaCheckURL) ;
+  hrc = http.GET() ;
+  if (hrc > 0) {
+    Serial.print("HTTP Response code : ") ;
+    Serial.println(hrc) ;
+    nv = http.getString().toInt() ;
+    Serial.print("Current version : ") ;
+    Serial.println(cv) ;
+    Serial.print("    New version : ") ;
+    Serial.println(nv) ;
+  } else {
+    Serial.print("Error code : ") ;
+    Serial.println(hrc) ;
+  }
+  http.end() ;
+  if (hrc <= 0) return ;
+  if (nv > cv) { // New version
+    Serial.println("OTA Updating...") ;
+    httpUpdate.rebootOnUpdate(false) ;
+    hur = httpUpdate.update(otaClient, otaBinURL) ;
+    switch (hur) {
+      case HTTP_UPDATE_FAILED :
+        Serial.printf("HTTP_UPDATE_FAILED Error (%d): %s\n\n",
+         httpUpdate.getLastError(), httpUpdate.getLastErrorString().c_str()) ;
+        break ;
+      case HTTP_UPDATE_NO_UPDATES :
+        Serial.println("HTTP_UPDATE_NO_UPDATES\n") ;
+        break ;
+      case HTTP_UPDATE_OK :
+        cv = nv ;
+        EEPROM_WriteData() ;
+        Serial.println("HTTP_UPDATE_OK\n") ;
+        ReSet() ;
+        break ;
     }
   }
-  Serial.println("mDNS responder started");
-  /*return index page which is stored in serverIndex */
-  server.on("/", HTTP_GET, []() {
-    server.sendHeader("Connection", "close");
-    server.send(200, "text/html", loginIndex);
-  });
-  server.on("/serverIndex", HTTP_GET, []() {
-    server.sendHeader("Connection", "close");
-    server.send(200, "text/html", serverIndex);
-  });
-  /*handling uploading firmware file */
-  server.on("/update", HTTP_POST, []() {
-    server.sendHeader("Connection", "close");
-    server.send(200, "text/plain", (Update.hasError()) ? "FAIL" : "OK");
-    ESP.restart();
-  }, []() {
-    HTTPUpload& upload = server.upload();
-    if (upload.status == UPLOAD_FILE_START) {
-      Serial.printf("Update: %s\n", upload.filename.c_str());
-      if (!Update.begin(UPDATE_SIZE_UNKNOWN)) { //start with max available size
-        Update.printError(Serial);
-      }
-    } else if (upload.status == UPLOAD_FILE_WRITE) {
-      /* flashing firmware to ESP*/
-      if (Update.write(upload.buf, upload.currentSize) != upload.currentSize) {
-        Update.printError(Serial);
-      }
-    } else if (upload.status == UPLOAD_FILE_END) {
-      if (Update.end(true)) { //true to set the size to the current progress
-        Serial.printf("Update Success: %u\nRebooting...\n", upload.totalSize);
-      } else {
-        Update.printError(Serial);
-      }
-    }
-  });
-  server.begin();
+  Serial.println("OTA update: no update neccessary");
 }
